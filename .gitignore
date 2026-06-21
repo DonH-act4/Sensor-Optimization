@@ -1,0 +1,30 @@
+# MATLAB datasets
+*.mat
+
+# W&B data
+wandb/
+
+# Experiment outputs
+results_*/
+
+# Model checkpoints
+*.pt
+*.pth
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+._*
+
+# VS Code machine-specific settings
+.vscode/
