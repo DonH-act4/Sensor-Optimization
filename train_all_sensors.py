@@ -19,7 +19,7 @@ from torch import nn
 from sensor_dataloader import DATASET_FILES, DataBundle, build_dataloaders
 
 
-ARCHITECTURE_VERSION = "all_sensor_cnn_v1"
+ARCHITECTURE_VERSION = "all_sensor_cnn_v2_temporal8"
 
 
 class PipeIDCNN(nn.Module):
@@ -30,13 +30,19 @@ class PipeIDCNN(nn.Module):
             self._block(64, 128, 7),
             self._block(128, 256, 5),
             self._block(256, 384, 3),
-            nn.AdaptiveAvgPool1d(1),
         )
+        # Keep eight ordered temporal regions instead of averaging the entire
+        # transient into one value. Pipe localization may depend on when and
+        # where waveform features occur, not only on their global average.
+        self.temporal_pool = nn.AdaptiveAvgPool1d(8)
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(384, 192),
+            nn.Linear(384 * 8, 512),
             nn.ReLU(inplace=True),
             nn.Dropout(0.4),
+            nn.Linear(512, 192),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
             nn.Linear(192, num_classes),
         )
 
@@ -53,7 +59,8 @@ class PipeIDCNN(nn.Module):
         )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.classifier(self.features(inputs))
+        features = self.features(inputs)
+        return self.classifier(self.temporal_pool(features))
 
 
 def parse_args() -> argparse.Namespace:
@@ -247,7 +254,7 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
         entity=args.wandb_entity,
         group="baseline",
         job_type="train",
-        name=f"baseline-{dataset}-seed{args.seed}",
+        name=f"baseline-v2-temporal8-{dataset}-seed{args.seed}",
         config=config,
         mode=args.wandb_mode,
         reinit=True,
@@ -345,7 +352,8 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
             step=args.epochs + 1,
         )
         artifact = wandb.Artifact(
-            f"baseline-{dataset}-seed{args.seed}", type="experiment-results"
+            f"baseline-v2-temporal8-{dataset}-seed{args.seed}",
+            type="experiment-results",
         )
         for path in (
             checkpoint_path,
