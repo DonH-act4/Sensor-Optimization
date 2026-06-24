@@ -25,6 +25,7 @@ ARCHITECTURE_VERSIONS = {
     "v2": "all_sensor_cnn_v2_temporal8",
     "v3": "all_sensor_resnet_v3_gapmax",
     "v4": "all_sensor_cnn_v4_wide_gap",
+    "v5": "all_sensor_patch_transformer_v5",
 }
 
 
@@ -214,6 +215,86 @@ class PipeIDResNetV3(nn.Module):
         return self.classifier(pooled)
 
 
+class PipeIDPatchTransformerV5(nn.Module):
+    """Conv-patch Transformer for long 12-channel transients.
+
+    The raw sequence has 3334 time points, which is too long for a vanilla
+    time-step Transformer in this small-data setting. This model first uses a
+    strided Conv1d tokenizer to make about 209 temporal tokens, then applies a
+    compact Transformer encoder and a CLS-token classification head.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 12,
+        num_classes: int = 13,
+        d_model: int = 128,
+        num_heads: int = 8,
+        num_layers: int = 4,
+        dim_feedforward: int = 512,
+        dropout: float = 0.15,
+        max_tokens: int = 256,
+    ) -> None:
+        super().__init__()
+        self.tokenizer = nn.Sequential(
+            nn.Conv1d(
+                in_channels, d_model, kernel_size=25,
+                stride=16, padding=12, bias=False
+            ),
+            nn.BatchNorm1d(d_model),
+            nn.GELU(),
+            nn.Conv1d(
+                d_model, d_model, kernel_size=7,
+                padding=3, groups=d_model, bias=False
+            ),
+            nn.BatchNorm1d(d_model),
+            nn.GELU(),
+        )
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.position_embedding = nn.Parameter(
+            torch.zeros(1, max_tokens + 1, d_model)
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=num_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+            norm=nn.LayerNorm(d_model),
+        )
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, 256),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, num_classes),
+        )
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.position_embedding, std=0.02)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        tokens = self.tokenizer(inputs).transpose(1, 2)
+        token_count = tokens.size(1)
+        if token_count + 1 > self.position_embedding.size(1):
+            raise ValueError(
+                f"Too many tokens ({token_count}); increase max_tokens in v5"
+            )
+        cls = self.cls_token.expand(tokens.size(0), -1, -1)
+        tokens = torch.cat([cls, tokens], dim=1)
+        tokens = tokens + self.position_embedding[:, : token_count + 1]
+        encoded = self.encoder(tokens)
+        return self.classifier(encoded[:, 0])
+
+
 def build_model(
     architecture: str,
     in_channels: int = 12,
@@ -227,6 +308,10 @@ def build_model(
         return PipeIDResNetV3(in_channels=in_channels, num_classes=num_classes)
     if architecture == "v4":
         return PipeIDCNNV4(in_channels=in_channels, num_classes=num_classes)
+    if architecture == "v5":
+        return PipeIDPatchTransformerV5(
+            in_channels=in_channels, num_classes=num_classes
+        )
     raise ValueError(f"Unknown architecture {architecture!r}")
 
 
@@ -254,7 +339,8 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ARCHITECTURE,
         help=(
             "v1=original GAP CNN, v2=temporal8 pilot, "
-            "v3=residual GAP+max CNN, v4=wider v1-style GAP CNN"
+            "v3=residual GAP+max CNN, v4=wider v1-style GAP CNN, "
+            "v5=conv-patch Transformer"
         ),
     )
     parser.add_argument("--learning-rate", type=float, default=1e-3)
