@@ -227,6 +227,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--scheduler-t-max",
+        type=int,
+        default=None,
+        help=(
+            "CosineAnnealingLR T_max. Defaults to --epochs. For short smoke "
+            "tests, set this to the planned full run length, e.g. 150 or 300."
+        ),
+    )
+    parser.add_argument(
+        "--no-scheduler",
+        action="store_true",
+        help="Keep the learning rate constant. Intended for debugging only.",
+    )
     parser.add_argument("--baseline-subtract", action="store_true")
     parser.add_argument("--wandb-entity", default=os.getenv("WANDB_ENTITY"))
     parser.add_argument(
@@ -368,6 +382,7 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
     output_root = Path(args.output_dir)
     dataset_dir = output_root / dataset
     arch_version = architecture_version(args.architecture)
+    scheduler_t_max = args.scheduler_t_max or args.epochs
     bundle: DataBundle = build_dataloaders(
         args.data_dir, dataset, output_root,
         batch_size=args.batch_size,
@@ -392,7 +407,8 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
         "optimizer": "AdamW",
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
-        "scheduler": "CosineAnnealingLR",
+        "scheduler": "none" if args.no_scheduler else "CosineAnnealingLR",
+        "scheduler_t_max": None if args.no_scheduler else scheduler_t_max,
         "normalization": "train_only_channel_zscore",
         "baseline_subtract": args.baseline_subtract,
         "architecture": arch_version,
@@ -418,9 +434,11 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
             model.parameters(), lr=args.learning_rate,
             weight_decay=args.weight_decay
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs
-        )
+        scheduler = None
+        if not args.no_scheduler:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=scheduler_t_max
+            )
         history: list[dict] = []
         start = time.perf_counter()
         for epoch in range(1, args.epochs + 1):
@@ -428,7 +446,8 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
             train_loss, train_accuracy = train_one_epoch(
                 model, bundle.train_loader, criterion, optimizer, device
             )
-            scheduler.step()
+            if scheduler is not None:
+                scheduler.step()
             row = {
                 "epoch": epoch,
                 "train_loss": train_loss,
@@ -525,6 +544,8 @@ def main() -> None:
     args = parse_args()
     if args.epochs <= 0 or args.batch_size <= 0:
         raise ValueError("epochs and batch-size must be positive")
+    if args.scheduler_t_max is not None and args.scheduler_t_max <= 0:
+        raise ValueError("scheduler-t-max must be positive")
     print(f"Architecture: {args.architecture} ({architecture_version(args.architecture)})")
     device = torch.device(
         "cuda" if torch.cuda.is_available()
