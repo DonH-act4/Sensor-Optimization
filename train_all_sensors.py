@@ -360,6 +360,18 @@ def parse_args() -> argparse.Namespace:
         help="Keep the learning rate constant. Intended for debugging only.",
     )
     parser.add_argument(
+        "--constant-after-epoch",
+        type=int,
+        default=None,
+        help=(
+            "Use the scheduler up to this accumulated epoch, then keep the "
+            "learning rate fixed at the value used during that epoch. Example: "
+            "--epochs 600 --scheduler-t-max 600 --constant-after-epoch 300 "
+            "trains epochs 1..300 with cosine decay, then epochs 301..600 "
+            "with the epoch-300 learning rate."
+        ),
+    )
+    parser.add_argument(
         "--resume-checkpoint",
         default=None,
         help=(
@@ -453,6 +465,7 @@ def save_checkpoint(
     weight_decay: float,
     scheduler_name: str,
     scheduler_t_max: int | None,
+    constant_after_epoch: int | None,
     wandb_run_id: str | None,
     git_commit_hash: str | None,
     resume_checkpoint: str | None,
@@ -480,6 +493,7 @@ def save_checkpoint(
             "weight_decay": weight_decay,
             "scheduler": scheduler_name,
             "scheduler_t_max": scheduler_t_max,
+            "constant_after_epoch": constant_after_epoch,
             "wandb_project": "SensorOptimization",
             "wandb_run_id": wandb_run_id,
             "git_commit": git_commit_hash,
@@ -672,6 +686,7 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
         "weight_decay": args.weight_decay,
         "scheduler": scheduler_name,
         "scheduler_t_max": None if args.no_scheduler else scheduler_t_max,
+        "constant_after_epoch": args.constant_after_epoch,
         "resume_checkpoint": str(resume_path) if resume_path else None,
         "resume_training_state": args.resume_training_state,
         "output_dir": str(dataset_dir),
@@ -744,7 +759,13 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
             train_loss, train_accuracy = train_one_epoch(
                 model, bundle.train_loader, criterion, optimizer, device
             )
-            if scheduler is not None:
+            if (
+                scheduler is not None
+                and (
+                    args.constant_after_epoch is None
+                    or epoch < args.constant_after_epoch
+                )
+            ):
                 scheduler.step()
             row = {
                 "epoch": epoch,
@@ -788,6 +809,7 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
                 weight_decay=args.weight_decay,
                 scheduler_name=scheduler_name,
                 scheduler_t_max=None if args.no_scheduler else scheduler_t_max,
+                constant_after_epoch=args.constant_after_epoch,
                 wandb_run_id=run.id,
                 git_commit_hash=git_hash,
                 resume_checkpoint=str(resume_path) if resume_path else None,
@@ -812,6 +834,7 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
                     weight_decay=args.weight_decay,
                     scheduler_name=scheduler_name,
                     scheduler_t_max=None if args.no_scheduler else scheduler_t_max,
+                    constant_after_epoch=args.constant_after_epoch,
                     wandb_run_id=run.id,
                     git_commit_hash=git_hash,
                     resume_checkpoint=str(resume_path) if resume_path else None,
@@ -849,6 +872,7 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
                 weight_decay=args.weight_decay,
                 scheduler_name=scheduler_name,
                 scheduler_t_max=None if args.no_scheduler else scheduler_t_max,
+                constant_after_epoch=args.constant_after_epoch,
                 wandb_run_id=run.id,
                 git_commit_hash=git_hash,
                 resume_checkpoint=str(resume_path) if resume_path else None,
@@ -863,6 +887,8 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
                     "start_epoch": start_epoch,
                     "additional_epochs": args.epochs,
                     "total_epoch": total_epoch,
+                    "scheduler_t_max": None if args.no_scheduler else scheduler_t_max,
+                    "constant_after_epoch": args.constant_after_epoch,
                     "checkpoint": checkpoint_path.name,
                     "wandb_run_id": run.id,
                     "wandb_run_name": run_name,
@@ -925,6 +951,10 @@ def main() -> None:
         raise ValueError("epochs and batch-size must be positive")
     if args.scheduler_t_max is not None and args.scheduler_t_max <= 0:
         raise ValueError("scheduler-t-max must be positive")
+    if args.constant_after_epoch is not None and args.constant_after_epoch <= 0:
+        raise ValueError("constant-after-epoch must be positive")
+    if args.no_scheduler and args.constant_after_epoch is not None:
+        raise ValueError("--constant-after-epoch cannot be combined with --no-scheduler")
     if args.checkpoint_every < 0:
         raise ValueError("checkpoint-every must be non-negative")
     if args.resume_checkpoint is not None and len(args.datasets) != 1:
