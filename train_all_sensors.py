@@ -19,11 +19,12 @@ from torch import nn
 from sensor_dataloader import DATASET_FILES, DataBundle, build_dataloaders
 
 
-DEFAULT_ARCHITECTURE = "v3"
+DEFAULT_ARCHITECTURE = "v1"
 ARCHITECTURE_VERSIONS = {
     "v1": "all_sensor_cnn_v1_gap",
     "v2": "all_sensor_cnn_v2_temporal8",
     "v3": "all_sensor_resnet_v3_gapmax",
+    "v4": "all_sensor_cnn_v4_wide_gap",
 }
 
 
@@ -101,6 +102,32 @@ class PipeIDCNNV2(PipeIDCNNV1):
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         features = self.features(inputs)
         return self.classifier(self.temporal_pool(features))
+
+
+class PipeIDCNNV4(PipeIDCNNV1):
+    """Wider v1-style CNN.
+
+    This is intentionally conservative: it keeps the v1 block layout, max
+    pooling schedule, global average pooling, and small classifier head. The
+    only material change is larger channel capacity.
+    """
+
+    def __init__(self, in_channels: int = 12, num_classes: int = 13) -> None:
+        nn.Module.__init__(self)
+        self.features = nn.Sequential(
+            self._block(in_channels, 96, 9),
+            self._block(96, 192, 7),
+            self._block(192, 384, 5),
+            self._block(384, 512, 3),
+        )
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.35),
+            nn.Linear(256, num_classes),
+        )
 
 
 class ResidualBlock1D(nn.Module):
@@ -198,6 +225,8 @@ def build_model(
         return PipeIDCNNV2(in_channels=in_channels, num_classes=num_classes)
     if architecture == "v3":
         return PipeIDResNetV3(in_channels=in_channels, num_classes=num_classes)
+    if architecture == "v4":
+        return PipeIDCNNV4(in_channels=in_channels, num_classes=num_classes)
     raise ValueError(f"Unknown architecture {architecture!r}")
 
 
@@ -223,7 +252,10 @@ def parse_args() -> argparse.Namespace:
         "--architecture",
         choices=sorted(ARCHITECTURE_VERSIONS),
         default=DEFAULT_ARCHITECTURE,
-        help="v1=original GAP CNN, v2=temporal8 pilot, v3=residual GAP+max CNN",
+        help=(
+            "v1=original GAP CNN, v2=temporal8 pilot, "
+            "v3=residual GAP+max CNN, v4=wider v1-style GAP CNN"
+        ),
     )
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
