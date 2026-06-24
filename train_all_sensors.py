@@ -19,10 +19,17 @@ from torch import nn
 from sensor_dataloader import DATASET_FILES, DataBundle, build_dataloaders
 
 
-ARCHITECTURE_VERSION = "all_sensor_cnn_v2_temporal8"
+DEFAULT_ARCHITECTURE = "v3"
+ARCHITECTURE_VERSIONS = {
+    "v1": "all_sensor_cnn_v1_gap",
+    "v2": "all_sensor_cnn_v2_temporal8",
+    "v3": "all_sensor_resnet_v3_gapmax",
+}
 
 
-class PipeIDCNN(nn.Module):
+class PipeIDCNNV1(nn.Module):
+    """Original stable all-sensor CNN baseline."""
+
     def __init__(self, in_channels: int = 12, num_classes: int = 13) -> None:
         super().__init__()
         self.features = nn.Sequential(
@@ -31,9 +38,42 @@ class PipeIDCNN(nn.Module):
             self._block(128, 256, 5),
             self._block(256, 384, 3),
         )
-        # Keep eight ordered temporal regions instead of averaging the entire
-        # transient into one value. Pipe localization may depend on when and
-        # where waveform features occur, not only on their global average.
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(384, 192),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.4),
+            nn.Linear(192, num_classes),
+        )
+
+    @staticmethod
+    def _block(in_channels: int, out_channels: int, kernel_size: int) -> nn.Module:
+        return nn.Sequential(
+            nn.Conv1d(
+                in_channels, out_channels, kernel_size,
+                padding=kernel_size // 2, bias=False
+            ),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(2),
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.pool(self.features(inputs)))
+
+
+class PipeIDCNNV2(PipeIDCNNV1):
+    """Temporal-pooling pilot model kept for reproducibility."""
+
+    def __init__(self, in_channels: int = 12, num_classes: int = 13) -> None:
+        nn.Module.__init__(self)
+        self.features = nn.Sequential(
+            self._block(in_channels, 64, 9),
+            self._block(64, 128, 7),
+            self._block(128, 256, 5),
+            self._block(256, 384, 3),
+        )
         self.temporal_pool = nn.AdaptiveAvgPool1d(8)
         self.classifier = nn.Sequential(
             nn.Flatten(),
@@ -63,6 +103,108 @@ class PipeIDCNN(nn.Module):
         return self.classifier(self.temporal_pool(features))
 
 
+class ResidualBlock1D(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        padding = kernel_size // 2
+        self.main = nn.Sequential(
+            nn.Conv1d(
+                in_channels, out_channels, kernel_size,
+                stride=stride, padding=padding, bias=False
+            ),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Conv1d(
+                out_channels, out_channels, kernel_size,
+                padding=padding, bias=False
+            ),
+            nn.BatchNorm1d(out_channels),
+        )
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, 1, stride=stride, bias=False),
+                nn.BatchNorm1d(out_channels),
+            )
+        else:
+            self.shortcut = nn.Identity()
+        self.activation = nn.ReLU(inplace=True)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.activation(self.main(inputs) + self.shortcut(inputs))
+
+
+class PipeIDResNetV3(nn.Module):
+    """Residual 1D CNN with average+max global pooling.
+
+    This version keeps the stable global-pooling behavior of v1, but improves
+    gradient flow and feature capacity through residual blocks. It avoids the
+    large flattened temporal head used by v2, which was harder to optimize in
+    the pilot run.
+    """
+
+    def __init__(self, in_channels: int = 12, num_classes: int = 13) -> None:
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv1d(in_channels, 64, 15, stride=2, padding=7, bias=False),
+            nn.BatchNorm1d(64),
+            nn.ReLU(inplace=True),
+        )
+        self.features = nn.Sequential(
+            ResidualBlock1D(64, 64, kernel_size=9),
+            ResidualBlock1D(64, 128, kernel_size=7, stride=2, dropout=0.05),
+            ResidualBlock1D(128, 128, kernel_size=7, dropout=0.05),
+            ResidualBlock1D(128, 256, kernel_size=5, stride=2, dropout=0.10),
+            ResidualBlock1D(256, 256, kernel_size=5, dropout=0.10),
+            ResidualBlock1D(256, 384, kernel_size=3, stride=2, dropout=0.10),
+            ResidualBlock1D(384, 384, kernel_size=3, dropout=0.10),
+        )
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
+        self.classifier = nn.Sequential(
+            nn.Linear(384 * 2, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        features = self.features(self.stem(inputs))
+        pooled = torch.cat(
+            [
+                self.avg_pool(features).flatten(1),
+                self.max_pool(features).flatten(1),
+            ],
+            dim=1,
+        )
+        return self.classifier(pooled)
+
+
+def build_model(
+    architecture: str,
+    in_channels: int = 12,
+    num_classes: int = 13,
+) -> nn.Module:
+    if architecture == "v1":
+        return PipeIDCNNV1(in_channels=in_channels, num_classes=num_classes)
+    if architecture == "v2":
+        return PipeIDCNNV2(in_channels=in_channels, num_classes=num_classes)
+    if architecture == "v3":
+        return PipeIDResNetV3(in_channels=in_channels, num_classes=num_classes)
+    raise ValueError(f"Unknown architecture {architecture!r}")
+
+
+def architecture_version(architecture: str) -> str:
+    return ARCHITECTURE_VERSIONS[architecture]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train all-sensor CNNs to predict 13 PipeID classes."
@@ -77,6 +219,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--architecture",
+        choices=sorted(ARCHITECTURE_VERSIONS),
+        default=DEFAULT_ARCHITECTURE,
+        help="v1=original GAP CNN, v2=temporal8 pilot, v3=residual GAP+max CNN",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--baseline-subtract", action="store_true")
@@ -219,6 +367,7 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
     set_seed(args.seed)  # Identical initialization for every noise condition.
     output_root = Path(args.output_dir)
     dataset_dir = output_root / dataset
+    arch_version = architecture_version(args.architecture)
     bundle: DataBundle = build_dataloaders(
         args.data_dir, dataset, output_root,
         batch_size=args.batch_size,
@@ -246,7 +395,7 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
         "scheduler": "CosineAnnealingLR",
         "normalization": "train_only_channel_zscore",
         "baseline_subtract": args.baseline_subtract,
-        "architecture": ARCHITECTURE_VERSION,
+        "architecture": arch_version,
         "git_commit": git_commit(),
     }
     run = wandb.init(
@@ -254,7 +403,7 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
         entity=args.wandb_entity,
         group="baseline",
         job_type="train",
-        name=f"baseline-v2-temporal8-{dataset}-seed{args.seed}",
+        name=f"baseline-{args.architecture}-{dataset}-seed{args.seed}",
         config=config,
         mode=args.wandb_mode,
         reinit=True,
@@ -263,7 +412,7 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
         # Reset after W&B initialization so every noise condition starts from
         # exactly the same model initialization and training RNG state.
         set_seed(args.seed)
-        model = PipeIDCNN().to(device)
+        model = build_model(args.architecture).to(device)
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=args.learning_rate,
@@ -316,12 +465,12 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
         torch.save(
             {
                 "model_state_dict": model.state_dict(),
-                "architecture": ARCHITECTURE_VERSION,
                 "num_classes": 13,
                 "selected_channel_ids": list(range(1, 13)),
                 "channel_mean": bundle.channel_mean,
                 "channel_std": bundle.channel_std,
                 "baseline_subtract": args.baseline_subtract,
+                "architecture": arch_version,
                 "epoch": args.epochs,
                 "seed": args.seed,
             },
@@ -352,7 +501,7 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
             step=args.epochs + 1,
         )
         artifact = wandb.Artifact(
-            f"baseline-v2-temporal8-{dataset}-seed{args.seed}",
+            f"baseline-{args.architecture}-{dataset}-seed{args.seed}",
             type="experiment-results",
         )
         for path in (
@@ -376,6 +525,7 @@ def main() -> None:
     args = parse_args()
     if args.epochs <= 0 or args.batch_size <= 0:
         raise ValueError("epochs and batch-size must be positive")
+    print(f"Architecture: {args.architecture} ({architecture_version(args.architecture)})")
     device = torch.device(
         "cuda" if torch.cuda.is_available()
         else "mps" if torch.backends.mps.is_available()
