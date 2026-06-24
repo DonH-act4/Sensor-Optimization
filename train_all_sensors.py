@@ -359,6 +359,45 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep the learning rate constant. Intended for debugging only.",
     )
+    parser.add_argument(
+        "--resume-checkpoint",
+        default=None,
+        help=(
+            "Continue training from a checkpoint. In resume mode, --epochs "
+            "means additional epochs, and output epoch numbers are accumulated."
+        ),
+    )
+    parser.add_argument(
+        "--resume-training-state",
+        action="store_true",
+        help=(
+            "Restore optimizer and scheduler state from the checkpoint when "
+            "available. Usually leave this off if the old scheduler already "
+            "annealed the learning rate to almost zero."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=50,
+        help=(
+            "Save a numbered local checkpoint every N accumulated epochs, "
+            "plus latest and final checkpoints. Use 0 to disable periodic saves."
+        ),
+    )
+    parser.add_argument(
+        "--wandb-run-id",
+        default=None,
+        help=(
+            "Explicit W&B run id. If omitted while resuming, the checkpoint's "
+            "wandb_run_id is reused when available."
+        ),
+    )
+    parser.add_argument(
+        "--new-wandb-run",
+        action="store_true",
+        help="Force a new W&B run even when the checkpoint has a wandb_run_id.",
+    )
     parser.add_argument("--baseline-subtract", action="store_true")
     parser.add_argument("--wandb-entity", default=os.getenv("WANDB_ENTITY"))
     parser.add_argument(
@@ -386,6 +425,68 @@ def git_commit() -> str | None:
         ).strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
+
+
+def experiment_dir_name(dataset: str, architecture: str, total_epoch: int) -> str:
+    return f"{dataset}_{architecture}_e{total_epoch:04d}"
+
+
+def checkpoint_filename(dataset: str, architecture: str, epoch: int) -> str:
+    return f"checkpoint_{dataset}_{architecture}_epoch{epoch:04d}.pt"
+
+
+def save_checkpoint(
+    path: Path,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None,
+    dataset: str,
+    architecture_key: str,
+    architecture: str,
+    epoch: int,
+    seed: int,
+    channel_mean: np.ndarray,
+    channel_std: np.ndarray,
+    baseline_subtract: bool,
+    learning_rate: float,
+    weight_decay: float,
+    scheduler_name: str,
+    scheduler_t_max: int | None,
+    wandb_run_id: str | None,
+    git_commit_hash: str | None,
+    resume_checkpoint: str | None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": (
+                scheduler.state_dict() if scheduler is not None else None
+            ),
+            "dataset": dataset,
+            "architecture_key": architecture_key,
+            "architecture": architecture,
+            "num_classes": 13,
+            "selected_channel_ids": list(range(1, 13)),
+            "channel_mean": channel_mean,
+            "channel_std": channel_std,
+            "baseline_subtract": baseline_subtract,
+            "epoch": epoch,
+            "seed": seed,
+            "optimizer": "AdamW",
+            "learning_rate": learning_rate,
+            "weight_decay": weight_decay,
+            "scheduler": scheduler_name,
+            "scheduler_t_max": scheduler_t_max,
+            "wandb_project": "SensorOptimization",
+            "wandb_run_id": wandb_run_id,
+            "git_commit": git_commit_hash,
+            "resume_checkpoint": resume_checkpoint,
+        },
+        path,
+    )
 
 
 def train_one_epoch(
@@ -496,11 +597,46 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
             "`wandb login`, or use --wandb-mode offline."
         ) from error
 
-    set_seed(args.seed)  # Identical initialization for every noise condition.
     output_root = Path(args.output_dir)
-    dataset_dir = output_root / dataset
+    output_root.mkdir(parents=True, exist_ok=True)
     arch_version = architecture_version(args.architecture)
     scheduler_t_max = args.scheduler_t_max or args.epochs
+    scheduler_name = "none" if args.no_scheduler else "CosineAnnealingLR"
+    resume_path = Path(args.resume_checkpoint) if args.resume_checkpoint else None
+    resume_checkpoint: dict | None = None
+    start_epoch = 0
+    checkpoint_wandb_run_id = None
+    if resume_path is not None:
+        resume_checkpoint = torch.load(resume_path, map_location=device)
+        if "dataset" in resume_checkpoint and resume_checkpoint["dataset"] != dataset:
+            raise ValueError(
+                f"Checkpoint dataset is {resume_checkpoint['dataset']!r}, "
+                f"but current dataset is {dataset!r}"
+            )
+        if (
+            "architecture_key" in resume_checkpoint
+            and resume_checkpoint["architecture_key"] != args.architecture
+        ):
+            raise ValueError(
+                f"Checkpoint architecture is "
+                f"{resume_checkpoint['architecture_key']!r}, but current "
+                f"architecture is {args.architecture!r}"
+            )
+        start_epoch = int(resume_checkpoint.get("epoch", 0))
+        checkpoint_wandb_run_id = resume_checkpoint.get("wandb_run_id")
+    total_epoch = start_epoch + args.epochs
+    dataset_dir = output_root / experiment_dir_name(
+        dataset, args.architecture, total_epoch
+    )
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    wandb_run_id = None
+    if not args.new_wandb_run:
+        wandb_run_id = args.wandb_run_id or checkpoint_wandb_run_id
+    elif args.wandb_run_id:
+        wandb_run_id = args.wandb_run_id
+    run_name = f"baseline-{args.architecture}-{dataset}-seed{args.seed}-e{total_epoch:04d}"
+
+    set_seed(args.seed)  # Identical initialization for every noise condition.
     bundle: DataBundle = build_dataloaders(
         args.data_dir, dataset, output_root,
         batch_size=args.batch_size,
@@ -509,6 +645,13 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
         test_size=0.2,
         channels=list(range(12)),
         baseline_subtract=args.baseline_subtract,
+    )
+    normalization_stats_path = dataset_dir / "normalization_stats.npz"
+    np.savez(
+        normalization_stats_path,
+        channel_mean=bundle.channel_mean,
+        channel_std=bundle.channel_std,
+        baseline_subtract=np.bool_(args.baseline_subtract),
     )
     config = {
         "method": "baseline",
@@ -521,27 +664,36 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
         "selected_channel_ids": list(range(1, 13)),
         "K": 12,
         "epochs": args.epochs,
+        "start_epoch": start_epoch,
+        "total_epoch": total_epoch,
         "batch_size": args.batch_size,
         "optimizer": "AdamW",
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
-        "scheduler": "none" if args.no_scheduler else "CosineAnnealingLR",
+        "scheduler": scheduler_name,
         "scheduler_t_max": None if args.no_scheduler else scheduler_t_max,
+        "resume_checkpoint": str(resume_path) if resume_path else None,
+        "resume_training_state": args.resume_training_state,
+        "output_dir": str(dataset_dir),
         "normalization": "train_only_channel_zscore",
         "baseline_subtract": args.baseline_subtract,
         "architecture": arch_version,
         "git_commit": git_commit(),
     }
-    run = wandb.init(
+    wandb_init_kwargs = dict(
         project="SensorOptimization",
         entity=args.wandb_entity,
         group="baseline",
         job_type="train",
-        name=f"baseline-{args.architecture}-{dataset}-seed{args.seed}",
+        name=run_name,
         config=config,
         mode=args.wandb_mode,
         reinit=True,
     )
+    if wandb_run_id:
+        wandb_init_kwargs["id"] = wandb_run_id
+        wandb_init_kwargs["resume"] = "allow"
+    run = wandb.init(**wandb_init_kwargs)
     try:
         # Reset after W&B initialization so every noise condition starts from
         # exactly the same model initialization and training RNG state.
@@ -557,9 +709,37 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=scheduler_t_max
             )
+        if resume_checkpoint is not None:
+            if "model_state_dict" in resume_checkpoint:
+                model.load_state_dict(resume_checkpoint["model_state_dict"])
+            else:
+                model.load_state_dict(resume_checkpoint)
+            if args.resume_training_state:
+                if "optimizer_state_dict" in resume_checkpoint:
+                    optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+                else:
+                    print(
+                        "Checkpoint has no optimizer_state_dict; "
+                        "continuing with a fresh optimizer."
+                    )
+                if scheduler is not None:
+                    scheduler_state = resume_checkpoint.get("scheduler_state_dict")
+                    if scheduler_state is not None:
+                        scheduler.load_state_dict(scheduler_state)
+                    else:
+                        print(
+                            "Checkpoint has no scheduler_state_dict; "
+                            "continuing with a fresh scheduler."
+                        )
+            print(
+                f"Loaded checkpoint {resume_path} at epoch {start_epoch}. "
+                f"Continuing to epoch {total_epoch}."
+            )
         history: list[dict] = []
         start = time.perf_counter()
-        for epoch in range(1, args.epochs + 1):
+        git_hash = git_commit()
+        for local_epoch in range(1, args.epochs + 1):
+            epoch = start_epoch + local_epoch
             learning_rate = optimizer.param_groups[0]["lr"]
             train_loss, train_accuracy = train_one_epoch(
                 model, bundle.train_loader, criterion, optimizer, device
@@ -568,6 +748,7 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
                 scheduler.step()
             row = {
                 "epoch": epoch,
+                "local_epoch": local_epoch,
                 "train_loss": train_loss,
                 "train_accuracy": train_accuracy,
                 "learning_rate": learning_rate,
@@ -583,10 +764,58 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
                 step=epoch,
             )
             print(
-                f"[{dataset}] epoch {epoch:03d}/{args.epochs}: "
+                f"[{dataset}] epoch {epoch:03d}/{total_epoch}: "
                 f"loss={train_loss:.6f}, accuracy={train_accuracy:.4f}, "
                 f"lr={learning_rate:.3e}"
             )
+            latest_checkpoint_path = (
+                dataset_dir / f"latest_{dataset}_{args.architecture}.pt"
+            )
+            save_checkpoint(
+                latest_checkpoint_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                dataset=dataset,
+                architecture_key=args.architecture,
+                architecture=arch_version,
+                epoch=epoch,
+                seed=args.seed,
+                channel_mean=bundle.channel_mean,
+                channel_std=bundle.channel_std,
+                baseline_subtract=args.baseline_subtract,
+                learning_rate=args.learning_rate,
+                weight_decay=args.weight_decay,
+                scheduler_name=scheduler_name,
+                scheduler_t_max=None if args.no_scheduler else scheduler_t_max,
+                wandb_run_id=run.id,
+                git_commit_hash=git_hash,
+                resume_checkpoint=str(resume_path) if resume_path else None,
+            )
+            if args.checkpoint_every > 0 and epoch % args.checkpoint_every == 0:
+                save_checkpoint(
+                    dataset_dir / checkpoint_filename(
+                        dataset, args.architecture, epoch
+                    ),
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    dataset=dataset,
+                    architecture_key=args.architecture,
+                    architecture=arch_version,
+                    epoch=epoch,
+                    seed=args.seed,
+                    channel_mean=bundle.channel_mean,
+                    channel_std=bundle.channel_std,
+                    baseline_subtract=args.baseline_subtract,
+                    learning_rate=args.learning_rate,
+                    weight_decay=args.weight_decay,
+                    scheduler_name=scheduler_name,
+                    scheduler_t_max=None if args.no_scheduler else scheduler_t_max,
+                    wandb_run_id=run.id,
+                    git_commit_hash=git_hash,
+                    resume_checkpoint=str(resume_path) if resume_path else None,
+                )
         training_seconds = time.perf_counter() - start
         pd.DataFrame(history).to_csv(dataset_dir / "train_history.csv", index=False)
 
@@ -598,20 +827,49 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
         report, matrix = save_evaluation(
             dataset_dir, metrics, y_true, y_pred, sample_indices
         )
-        checkpoint_path = dataset_dir / "final_model.pt"
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "num_classes": 13,
-                "selected_channel_ids": list(range(1, 13)),
-                "channel_mean": bundle.channel_mean,
-                "channel_std": bundle.channel_std,
-                "baseline_subtract": args.baseline_subtract,
-                "architecture": arch_version,
-                "epoch": args.epochs,
-                "seed": args.seed,
-            },
-            checkpoint_path,
+        checkpoint_path = dataset_dir / checkpoint_filename(
+            dataset, args.architecture, total_epoch
+        )
+        final_alias_path = dataset_dir / "final_model.pt"
+        for path in (checkpoint_path, final_alias_path):
+            save_checkpoint(
+                path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                dataset=dataset,
+                architecture_key=args.architecture,
+                architecture=arch_version,
+                epoch=total_epoch,
+                seed=args.seed,
+                channel_mean=bundle.channel_mean,
+                channel_std=bundle.channel_std,
+                baseline_subtract=args.baseline_subtract,
+                learning_rate=args.learning_rate,
+                weight_decay=args.weight_decay,
+                scheduler_name=scheduler_name,
+                scheduler_t_max=None if args.no_scheduler else scheduler_t_max,
+                wandb_run_id=run.id,
+                git_commit_hash=git_hash,
+                resume_checkpoint=str(resume_path) if resume_path else None,
+            )
+        (dataset_dir / "wandb_run_id.txt").write_text(run.id + "\n")
+        (dataset_dir / "experiment_info.json").write_text(
+            json.dumps(
+                {
+                    "dataset": dataset,
+                    "architecture_key": args.architecture,
+                    "architecture": arch_version,
+                    "start_epoch": start_epoch,
+                    "additional_epochs": args.epochs,
+                    "total_epoch": total_epoch,
+                    "checkpoint": checkpoint_path.name,
+                    "wandb_run_id": run.id,
+                    "wandb_run_name": run_name,
+                    "resume_checkpoint": str(resume_path) if resume_path else None,
+                },
+                indent=2,
+            )
         )
 
         per_pipe = report.loc[[f"PipeID_{i}" for i in range(1, 14)]]
@@ -635,21 +893,24 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
                 "timing/training_seconds": training_seconds,
                 "timing/inference_seconds": metrics["inference_seconds"],
             },
-            step=args.epochs + 1,
+            step=total_epoch + 1,
         )
         artifact = wandb.Artifact(
-            f"baseline-{args.architecture}-{dataset}-seed{args.seed}",
+            f"baseline-{args.architecture}-{dataset}-seed{args.seed}-e{total_epoch:04d}",
             type="experiment-results",
         )
         for path in (
             checkpoint_path,
+            final_alias_path,
             dataset_dir / "train_history.csv",
             dataset_dir / "test_metrics.json",
             dataset_dir / "classification_report.csv",
             dataset_dir / "confusion_matrix.csv",
             dataset_dir / "test_predictions.csv",
-            dataset_dir / "normalization_stats.npz",
             output_root / "split_indices_80_20.npz",
+            normalization_stats_path,
+            dataset_dir / "experiment_info.json",
+            dataset_dir / "wandb_run_id.txt",
         ):
             artifact.add_file(str(path))
         run.log_artifact(artifact)
@@ -664,6 +925,13 @@ def main() -> None:
         raise ValueError("epochs and batch-size must be positive")
     if args.scheduler_t_max is not None and args.scheduler_t_max <= 0:
         raise ValueError("scheduler-t-max must be positive")
+    if args.checkpoint_every < 0:
+        raise ValueError("checkpoint-every must be non-negative")
+    if args.resume_checkpoint is not None and len(args.datasets) != 1:
+        raise ValueError(
+            "--resume-checkpoint can only be used with exactly one dataset. "
+            "Resume clean/snr0/snr1/snr5 separately with their own checkpoints."
+        )
     print(f"Architecture: {args.architecture} ({architecture_version(args.architecture)})")
     device = torch.device(
         "cuda" if torch.cuda.is_available()
