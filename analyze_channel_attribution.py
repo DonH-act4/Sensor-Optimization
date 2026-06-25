@@ -30,6 +30,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-steps", type=int, default=64)
     parser.add_argument("--internal-batch-size", type=int, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument(
+        "--save-per-sample",
+        action="store_true",
+        help="Also save per-sample channel scores. Off by default to keep JSON small.",
+    )
     parser.add_argument("--baseline-subtract", action="store_true")
     parser.add_argument("--wandb-entity", default=os.getenv("WANDB_ENTITY"))
     parser.add_argument(
@@ -117,7 +122,7 @@ def main() -> None:
     global_sum = np.zeros(12, dtype=np.float64)
     per_pipe_sum = np.zeros((13, 12), dtype=np.float64)
     per_pipe_count = np.zeros(13, dtype=np.int64)
-    sample_records: list[dict] = []
+    sample_records: list[dict] | None = [] if args.save_per_sample else None
     sample_count = 0
 
     for signals, labels, indices in loader:
@@ -146,13 +151,14 @@ def main() -> None:
         for row, label, sample_index in zip(channel_scores, labels_np, indices_np):
             per_pipe_sum[label] += row
             per_pipe_count[label] += 1
-            sample_records.append(
-                {
-                    "sample_index": int(sample_index),
-                    "true_pipe_id": int(label + 1),
-                    "scores": [float(value) for value in row],
-                }
-            )
+            if sample_records is not None:
+                sample_records.append(
+                    {
+                        "sample_index": int(sample_index),
+                        "true_pipe_id": int(label + 1),
+                        "scores": [float(value) for value in row],
+                    }
+                )
         sample_count += len(labels_np)
         print(f"Attributed {sample_count} samples")
 
@@ -180,15 +186,17 @@ def main() -> None:
             f"PipeID_{pipe_id}": sorted_channel_records(per_pipe_scores[pipe_id - 1])
             for pipe_id in range(1, 14)
         },
-        "per_sample_scores": sample_records,
         "config": {
             "n_steps": args.n_steps,
             "baseline": "zero_normalized_input",
             "target": "true_pipe_id_logit",
             "sample_count": sample_count,
+            "save_per_sample": args.save_per_sample,
             "seed": args.seed,
         },
     }
+    if sample_records is not None:
+        result["per_sample_scores"] = sample_records
     output_path = output_dir / f"{args.dataset}_{architecture_key}_ig_{args.split}.json"
     output_path.write_text(json.dumps(result, indent=2))
     artifact = wandb.Artifact(
