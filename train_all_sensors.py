@@ -496,6 +496,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--eval-test-every",
+        type=int,
+        default=0,
+        help=(
+            "Evaluate the held-out test set every N accumulated epochs and log "
+            "test_epoch/loss, test_epoch/accuracy, and test_epoch/macro_f1 to "
+            "W&B. Default 0 keeps test evaluation final-only."
+        ),
+    )
+    parser.add_argument(
         "--wandb-run-id",
         default=None,
         help=(
@@ -791,6 +801,7 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
         "scheduler": scheduler_name,
         "scheduler_t_max": None if args.no_scheduler else scheduler_t_max,
         "constant_after_epoch": args.constant_after_epoch,
+        "eval_test_every": args.eval_test_every,
         "resume_checkpoint": str(resume_path) if resume_path else None,
         "resume_training_state": args.resume_training_state,
         "output_dir": str(dataset_dir),
@@ -888,6 +899,25 @@ def run_dataset(args: argparse.Namespace, dataset: str, device: torch.device) ->
                 },
                 step=epoch,
             )
+            if args.eval_test_every > 0 and epoch % args.eval_test_every == 0:
+                test_metrics, _, _, _, _ = evaluate(
+                    model, bundle.test_loader, criterion, device
+                )
+                run.log(
+                    {
+                        "epoch": epoch,
+                        "test_epoch/loss": test_metrics["loss"],
+                        "test_epoch/accuracy": test_metrics["accuracy"],
+                        "test_epoch/macro_f1": test_metrics["macro_f1"],
+                    },
+                    step=epoch,
+                )
+                print(
+                    f"[{dataset}] test@epoch {epoch:03d}: "
+                    f"loss={test_metrics['loss']:.6f}, "
+                    f"accuracy={test_metrics['accuracy']:.4f}, "
+                    f"macro_f1={test_metrics['macro_f1']:.4f}"
+                )
             print(
                 f"[{dataset}] epoch {epoch:03d}/{total_epoch}: "
                 f"loss={train_loss:.6f}, accuracy={train_accuracy:.4f}, "
@@ -1061,6 +1091,8 @@ def main() -> None:
         raise ValueError("--constant-after-epoch cannot be combined with --no-scheduler")
     if args.checkpoint_every < 0:
         raise ValueError("checkpoint-every must be non-negative")
+    if args.eval_test_every < 0:
+        raise ValueError("eval-test-every must be non-negative")
     if args.resume_checkpoint is not None and len(args.datasets) != 1:
         raise ValueError(
             "--resume-checkpoint can only be used with exactly one dataset. "
