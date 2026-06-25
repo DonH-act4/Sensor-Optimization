@@ -26,6 +26,7 @@ ARCHITECTURE_VERSIONS = {
     "v3": "all_sensor_resnet_v3_gapmax",
     "v4": "all_sensor_cnn_v4_wide_gap",
     "v5": "all_sensor_patch_transformer_v5",
+    "v6": "all_sensor_tcn_v6_dilated",
 }
 
 
@@ -295,6 +296,101 @@ class PipeIDPatchTransformerV5(nn.Module):
         return self.classifier(encoded[:, 0])
 
 
+class TCNResidualBlock(nn.Module):
+    """Same-length non-causal residual TCN block."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        dilation: int,
+        kernel_size: int = 7,
+        dropout: float = 0.15,
+    ) -> None:
+        super().__init__()
+        padding = (kernel_size // 2) * dilation
+        self.main = nn.Sequential(
+            nn.Conv1d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                padding=padding,
+                dilation=dilation,
+                bias=False,
+            ),
+            nn.BatchNorm1d(out_channels),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(
+                out_channels,
+                out_channels,
+                kernel_size,
+                padding=padding,
+                dilation=dilation,
+                bias=False,
+            ),
+            nn.BatchNorm1d(out_channels),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        if in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm1d(out_channels),
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.main(inputs) + self.shortcut(inputs)
+
+
+class PipeIDTCNV6(nn.Module):
+    """Attribution-friendly non-causal dilated TCN.
+
+    The model keeps the full temporal resolution through the dilated residual
+    stack, then uses global average pooling only. This preserves long-range
+    temporal context while keeping Integrated Gradients channel attribution
+    straightforward and smooth.
+    """
+
+    def __init__(self, in_channels: int = 12, num_classes: int = 13) -> None:
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv1d(in_channels, 64, kernel_size=7, padding=3, bias=False),
+            nn.BatchNorm1d(64),
+            nn.GELU(),
+        )
+        channels = [96, 128, 160, 192, 192, 192, 192, 192]
+        dilations = [1, 2, 4, 8, 16, 32, 64, 128]
+        blocks: list[nn.Module] = []
+        current_channels = 64
+        for out_channels, dilation in zip(channels, dilations, strict=True):
+            blocks.append(
+                TCNResidualBlock(
+                    current_channels,
+                    out_channels,
+                    dilation=dilation,
+                    kernel_size=7,
+                    dropout=0.15,
+                )
+            )
+            current_channels = out_channels
+        self.features = nn.Sequential(*blocks)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(192, 256),
+            nn.GELU(),
+            nn.Dropout(0.25),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        features = self.features(self.stem(inputs))
+        return self.classifier(self.pool(features))
+
+
 def build_model(
     architecture: str,
     in_channels: int = 12,
@@ -312,6 +408,8 @@ def build_model(
         return PipeIDPatchTransformerV5(
             in_channels=in_channels, num_classes=num_classes
         )
+    if architecture == "v6":
+        return PipeIDTCNV6(in_channels=in_channels, num_classes=num_classes)
     raise ValueError(f"Unknown architecture {architecture!r}")
 
 
@@ -340,7 +438,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "v1=original GAP CNN, v2=temporal8 pilot, "
             "v3=residual GAP+max CNN, v4=wider v1-style GAP CNN, "
-            "v5=conv-patch Transformer"
+            "v5=conv-patch Transformer, v6=dilated TCN"
         ),
     )
     parser.add_argument("--learning-rate", type=float, default=1e-3)
