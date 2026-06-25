@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from sensor_dataloader import DATASET_FILES, build_dataloaders
-from train_all_sensors import build_model, git_commit
+from train_all_sensors import ARCHITECTURE_VERSIONS, build_model, git_commit
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,7 +74,7 @@ def main() -> None:
         or checkpoint.get("architecture")
         or "v6"
     )
-    if architecture_key not in {"v1", "v2", "v3", "v4", "v5", "v6"}:
+    if architecture_key not in ARCHITECTURE_VERSIONS:
         raise ValueError(
             "Pass --architecture because checkpoint architecture_key is missing "
             f"or not a key: {architecture_key!r}"

@@ -27,6 +27,7 @@ ARCHITECTURE_VERSIONS = {
     "v4": "all_sensor_cnn_v4_wide_gap",
     "v5": "all_sensor_patch_transformer_v5",
     "v6": "all_sensor_tcn_v6_dilated",
+    "v7": "all_sensor_tcn_v7_dilated6",
 }
 
 
@@ -345,7 +346,7 @@ class TCNResidualBlock(nn.Module):
         return self.main(inputs) + self.shortcut(inputs)
 
 
-class PipeIDTCNV6(nn.Module):
+class PipeIDTCN(nn.Module):
     """Attribution-friendly non-causal dilated TCN.
 
     The model keeps the full temporal resolution through the dilated residual
@@ -354,15 +355,24 @@ class PipeIDTCNV6(nn.Module):
     straightforward and smooth.
     """
 
-    def __init__(self, in_channels: int = 12, num_classes: int = 13) -> None:
+    def __init__(
+        self,
+        in_channels: int = 12,
+        num_classes: int = 13,
+        channels: tuple[int, ...] = (96, 128, 160, 192, 192, 192, 192, 192),
+        dilations: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128),
+        dropout: float = 0.15,
+    ) -> None:
         super().__init__()
+        if len(channels) != len(dilations):
+            raise ValueError("TCN channels and dilations must have the same length")
+        if not channels:
+            raise ValueError("TCN must have at least one residual block")
         self.stem = nn.Sequential(
             nn.Conv1d(in_channels, 64, kernel_size=7, padding=3, bias=False),
             nn.BatchNorm1d(64),
             nn.GELU(),
         )
-        channels = [96, 128, 160, 192, 192, 192, 192, 192]
-        dilations = [1, 2, 4, 8, 16, 32, 64, 128]
         blocks: list[nn.Module] = []
         current_channels = 64
         for out_channels, dilation in zip(channels, dilations, strict=True):
@@ -372,7 +382,7 @@ class PipeIDTCNV6(nn.Module):
                     out_channels,
                     dilation=dilation,
                     kernel_size=7,
-                    dropout=0.15,
+                    dropout=dropout,
                 )
             )
             current_channels = out_channels
@@ -380,7 +390,7 @@ class PipeIDTCNV6(nn.Module):
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(192, 256),
+            nn.Linear(current_channels, 256),
             nn.GELU(),
             nn.Dropout(0.25),
             nn.Linear(256, num_classes),
@@ -389,6 +399,32 @@ class PipeIDTCNV6(nn.Module):
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         features = self.features(self.stem(inputs))
         return self.classifier(self.pool(features))
+
+
+class PipeIDTCNV6(PipeIDTCN):
+    """Full 8-block dilated TCN, receptive field close to the full signal."""
+
+    def __init__(self, in_channels: int = 12, num_classes: int = 13) -> None:
+        super().__init__(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            channels=(96, 128, 160, 192, 192, 192, 192, 192),
+            dilations=(1, 2, 4, 8, 16, 32, 64, 128),
+            dropout=0.15,
+        )
+
+
+class PipeIDTCNV7(PipeIDTCN):
+    """Smaller 6-block dilated TCN for reduced capacity and memory use."""
+
+    def __init__(self, in_channels: int = 12, num_classes: int = 13) -> None:
+        super().__init__(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            channels=(96, 128, 160, 192, 192, 192),
+            dilations=(1, 2, 4, 8, 16, 32),
+            dropout=0.15,
+        )
 
 
 def build_model(
@@ -410,6 +446,8 @@ def build_model(
         )
     if architecture == "v6":
         return PipeIDTCNV6(in_channels=in_channels, num_classes=num_classes)
+    if architecture == "v7":
+        return PipeIDTCNV7(in_channels=in_channels, num_classes=num_classes)
     raise ValueError(f"Unknown architecture {architecture!r}")
 
 
@@ -438,7 +476,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "v1=original GAP CNN, v2=temporal8 pilot, "
             "v3=residual GAP+max CNN, v4=wider v1-style GAP CNN, "
-            "v5=conv-patch Transformer, v6=dilated TCN"
+            "v5=conv-patch Transformer, v6=8-block dilated TCN, "
+            "v7=6-block smaller dilated TCN"
         ),
     )
     parser.add_argument("--learning-rate", type=float, default=1e-3)

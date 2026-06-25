@@ -15,6 +15,7 @@ from torch import nn
 
 from sensor_dataloader import DATASET_FILES, build_dataloaders
 from train_all_sensors import (
+    ARCHITECTURE_VERSIONS,
     architecture_version,
     build_model,
     evaluate,
@@ -36,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, required=True)
     parser.add_argument(
         "--architecture",
-        choices=("v1", "v2", "v3", "v4", "v5", "v6"),
+        choices=sorted(ARCHITECTURE_VERSIONS),
         default="v6",
     )
     parser.add_argument("--epochs", type=int, default=300)
